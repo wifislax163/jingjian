@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl tar unzip jq makeself python3
 
-      - name: 2. 裁剪 luci-app-ssr-plus（内置 Python 生成简体中文 .lmo）并封装 IPK
+      - name: 2. 裁剪 luci-app-ssr-plus（内置简体中文与 url.lua）并封装 IPK
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -48,9 +48,12 @@ jobs:
           cp -rf "${SRC_SSR}/root/"* "${DST_DATA}/"
           cp -rf "${SRC_SSR}/luasrc/"* "${DST_DATA}/usr/lib/lua/luci/"
 
-          # 使用 Python 直接将 .po 编译为标准 LuCI .lmo 二进制文件（零外部依赖）
+          # 直接内置 url.lua，彻底解决精简固件缺少 socket.url 模块导致无法解析订阅的问题
+          curl -fSL "https://raw.githubusercontent.com/lunarmodules/luasocket/master/src/url.lua" -o "${DST_DATA}/usr/lib/lua/url.lua"
+
+          # 使用 Python 直接将 .po 编译为标准 LuCI .lmo 简体中文语言包
           python3 - "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${DST_DATA}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo" << 'PYEOF'
-          import sys, struct, re
+          import sys, struct
 
           def sfh_hash(data):
               length = len(data)
@@ -210,6 +213,7 @@ jobs:
           }
 
           for pkg in ipset luci-lib-jsonc luci-compat coreutils-base64 \
+                     curl ca-bundle ca-certificates \
                      shadowsocks-libev-ss-local shadowsocks-libev-ss-redir \
                      libev libsodium libudns libpcre libmbedtls12; do
             fetch_ipk "$pkg"
@@ -249,7 +253,7 @@ jobs:
           chmod 755 /usr/bin/xray
           ln -sf /usr/bin/xray /usr/bin/trojan 2>/dev/null || true
 
-          echo ">>> [3/3] 安装裁剪版 luci-app-ssr-plus（含简体中文包）及运行库..."
+          echo ">>> [3/3] 安装裁剪版 luci-app-ssr-plus（含中文包与 url.lua）及运行库..."
           opkg install ./ipks/*.ipk --force-depends --force-overwrite
 
           /etc/init.d/rpcd restart 2>/dev/null || true
@@ -280,6 +284,6 @@ jobs:
             - **目标硬件**：MT7621 (`mipsel_24kc`)
             - **目标系统**：OpenWrt 22.03 / GL.iNet 4.x（原生 `fw4` / `iptables-nft` + `ipset`）
             - **集成核心**：`shadowsocks-libev` + `Xray-core` `${{ env.XRAY_VER }}`
-            - **内置特性**：已编译内置简体中文语言包（`ssr-plus.zh-cn.lmo`）、标准 `.ipk` 注册（后台可直接卸载）、`--gzip` 封装免装 `xz`。
+            - **内置特性**：内置简体中文语言包（`ssr-plus.zh-cn.lmo`）、内置 `url.lua` 订阅解码模块、标准 `.ipk` 注册、`--gzip` 免 `xz` 封装。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
