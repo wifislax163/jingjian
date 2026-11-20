@@ -25,11 +25,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y curl tar unzip jq makeself gcc
-          LUCI_SRC="https://raw.githubusercontent.com/openwrt/luci/openwrt-22.03/modules/luci-base/src"
-          curl -fSL "${LUCI_SRC}/po2lmo.c" -o /tmp/po2lmo.c
-          curl -fSL "${LUCI_SRC}/template_lmo.c" -o /tmp/template_lmo.c
-          curl -fSL "${LUCI_SRC}/template_lmo.h" -o /tmp/template_lmo.h
-          gcc /tmp/po2lmo.c /tmp/template_lmo.c -I/tmp -o /usr/local/bin/po2lmo
+          # 使用独立单文件版 po2lmo.c（无额外头文件依赖，生成的 .lmo 格式全版本通用）
+          curl -fSL "https://raw.githubusercontent.com/openwrt/luci/openwrt-19.07/modules/luci-base/src/po2lmo.c" -o /tmp/po2lmo.c
+          gcc /tmp/po2lmo.c -o /usr/local/bin/po2lmo
+          po2lmo --help >/dev/null 2>&1 || true
 
       - name: 2. 裁剪 luci-app-ssr-plus（含简体中文语言包）并封装标准 IPK
         env:
@@ -56,6 +55,7 @@ jobs:
           # 编译简体中文翻译文件 (.po -> .lmo)
           if [ -f "${SRC_SSR}/po/zh-cn/ssr-plus.po" ]; then
             po2lmo "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${DST_DATA}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo"
+            ls -lh "${DST_DATA}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo"
           fi
 
           # 删除服务端与冗余规则，保留完整 controller 语法结构
