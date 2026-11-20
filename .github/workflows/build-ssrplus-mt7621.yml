@@ -25,10 +25,10 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 安装构建与压缩依赖
+      - name: 1. 安装构建依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl tar unzip xz-utils jq makeself upx-ucl
+          sudo apt-get install -y curl tar unzip xz-utils jq makeself
 
       - name: 2. 裁剪 luci-app-ssr-plus 源码并打包依赖
         env:
@@ -62,7 +62,7 @@ jobs:
           find "${DST_LUCI}/etc/shadowsocksr" -type f \( -name "*ad*" -o -name "*netflix*" -o -name "*disney*" \) -delete 2>/dev/null || true
           sed -i '/"server"/d;/server-config/d;/netflix/d' "${DST_LUCI}/usr/lib/lua/luci/controller/shadowsocksr.lua"
 
-          # 2.2 预下载 OpenWrt 21.02.7 软件源索引（避免重复请求）
+          # 2.2 预下载 OpenWrt 21.02.7 软件源索引
           echo ">>> 下载 OpenWrt ${OPENWRT_VER} (${ARCH}) 软件源索引..."
           BASE_FEED="https://archive.openwrt.org/releases/${OPENWRT_VER}/packages/${ARCH}"
           KMOD_FEED="https://archive.openwrt.org/releases/${OPENWRT_VER}/targets/ramips/mt7621/packages"
@@ -89,13 +89,16 @@ jobs:
                 return 0
               fi
             done
-            echo "  ! 警告: 未在官方源找到 ${pkg_name}（若固件已内置可忽略）"
+            echo "  ! 警告: 未找到 ${pkg_name}（若固件已内置可忽略）"
             return 0
           }
 
+          # 基础依赖 + 官方 shadowsocks-libev 核心及其运行时库
           for pkg in ipset iptables-mod-tproxy kmod-ipt-tproxy kmod-nf-tproxy \
                      libustream-openssl ca-bundle ca-certificates \
-                     lua luci-lib-jsonc luci-compat coreutils-base64; do
+                     lua luci-lib-jsonc luci-compat coreutils-base64 \
+                     shadowsocks-libev-ss-local shadowsocks-libev-ss-redir \
+                     libev libsodium libudns libpcre libmbedtls12; do
             fetch_ipk "$pkg"
           done
 
@@ -112,33 +115,13 @@ jobs:
           unzip -q "${WORK_DIR}/xray.zip" xray -d "${PKG_DIR}/bins/"
           chmod +x "${PKG_DIR}/bins/xray"
 
-          # 2.4 使用 GITHUB_TOKEN + jq 精准获取 Shadowsocks-rust (mipsel-unknown-linux-musl)
-          echo ">>> 获取 Shadowsocks-rust (mipsel-musl)..."
-          SS_JSON=$(curl -fSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest")
-          SS_VER=$(echo "$SS_JSON" | jq -r '.tag_name')
-          SS_URL=$(echo "$SS_JSON" | jq -r '.assets[] | select(.name | test("mipsel-unknown-linux-musl\\.tar\\.xz$")) | .browser_download_url' | head -n 1)
-          # 兜底：若最新版移除 mipsel 预编译包，自动回退到稳定的 v1.21.2
-          if [ -z "$SS_URL" ] || [ "$SS_URL" = "null" ]; then
-            echo "提示: 最新版无 mipsel-musl 资产，回退至稳定版 v1.21.2..."
-            SS_VER="v1.21.2"
-            SS_URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.21.2/shadowsocks-v1.21.2.mipsel-unknown-linux-musl.tar.xz"
-          fi
-          curl -fSL "$SS_URL" -o "${WORK_DIR}/ss-rust.tar.xz"
-          tar -xJf "${WORK_DIR}/ss-rust.tar.xz" -C "${PKG_DIR}/bins/" sslocal
-          chmod +x "${PKG_DIR}/bins/sslocal"
-
-          # 128MB 内存专用策略：仅压缩 sslocal，xray 保持未压缩防运行时 OOM
-          upx --best --lzma "${PKG_DIR}/bins/sslocal" || true
-
           echo "XRAY_VER=${XRAY_VER}" >> "$GITHUB_ENV"
-          echo "SS_VER=${SS_VER}" >> "$GITHUB_ENV"
 
       - name: 3. 生成 128MB 内存防爆安装脚本并封装 Makeself (.run)
         run: |
           set -euo pipefail
           PKG_DIR="${GITHUB_WORKSPACE}/build_tmp/payload"
 
-          # 使用 sed 剥离缩进，确保 #!/bin/sh 顶格生效
           sed 's/^          //' << 'EOF' > "${PKG_DIR}/install.sh"
           #!/bin/sh
           set -e
@@ -153,21 +136,20 @@ jobs:
               exit 1
           fi
 
-          # 1. 释放页面缓存并预留系统紧急内存，防止 128MB 机器安装过程 OOM
+          # 1. 释放页面缓存并预留紧急内存，防止 128MB 机器安装过程 OOM
           sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
           sysctl -w vm.min_free_kbytes=4096 >/dev/null 2>&1 || true
 
-          # 2. 离线安装依赖
-          echo ">>> [1/4] 离线安装依赖 IPK..."
+          # 2. 离线安装依赖与 shadowsocks-libev 核心
+          echo ">>> [1/4] 离线安装依赖与 shadowsocks-libev..."
           if ls ./ipks/*.ipk >/dev/null 2>&1; then
               opkg install ./ipks/*.ipk --force-depends --force-overwrite || true
           fi
 
-          # 3. 部署核心二进制
-          echo ">>> [2/4] 部署 xray 与 sslocal 核心..."
+          # 3. 部署 Xray 核心
+          echo ">>> [2/4] 部署 xray 核心..."
           cp -f ./bins/xray /usr/bin/xray
-          cp -f ./bins/sslocal /usr/bin/sslocal
-          chmod 755 /usr/bin/xray /usr/bin/sslocal
+          chmod 755 /usr/bin/xray
           ln -sf /usr/bin/xray /usr/bin/trojan 2>/dev/null || true
 
           # 4. 部署裁剪版 LuCI 与 128MB 内存守护调优
@@ -197,8 +179,6 @@ jobs:
           EOF
 
           chmod +x "${PKG_DIR}/install.sh"
-          head -n 3 "${PKG_DIR}/install.sh"
-
           makeself --xz --notemp "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus-Lite MT7621 128MB" ./install.sh
           ls -lh "${GITHUB_WORKSPACE}/${OUTPUT_NAME}"
 
@@ -221,7 +201,7 @@ jobs:
             - **目标硬件**：MT7621 (`mipsel_24kc` / 128MB RAM 内存防爆优化版)
             - **目标系统**：OpenWrt 21.02（原生 `iptables` + `ipset`）
             - **集成核心**：
-              - `shadowsocks-rust` `${{ env.SS_VER }}`（UPX 压缩，常驻内存 ~4MB，**128MB 机器首选**）
+              - `shadowsocks-libev`（OpenWrt 21.02 官方纯 C 编译版，常驻内存 ~2-3MB，**128MB 机器首选**）
               - `Xray-core` `${{ env.XRAY_VER }}`（未压缩防内存峰值，原生支持 VLESS / VMess / Reality / Trojan / Hysteria2）
 
             ### 安装命令（请勿在 `/tmp` 解压以免撑爆内存盘）
