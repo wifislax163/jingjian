@@ -190,7 +190,7 @@ jobs:
           tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/control.tar.gz" -C "${SSR_BUILD}/control" .
           tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_1.0-${SSR_REV}-lite_all.ipk" -C "${SSR_BUILD}" debian-binary control.tar.gz data.tar.gz
 
-          # 2.3 获取 Xray-core 并封装为标准 xray-core IPK（让后台软件包列表可管理可卸载）
+          # 2.3 获取 Xray-core 并封装为标准 xray-core IPK
           XRAY_JSON=$(curl -fSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/XTLS/Xray-core/releases/latest")
           XRAY_VER=$(echo "$XRAY_JSON" | jq -r '.tag_name' | sed 's/^v//')
           XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le\\.zip$")) | .browser_download_url' | head -n 1)
@@ -215,7 +215,7 @@ jobs:
           tar --numeric-owner --owner=0 --group=0 -czf "${XRAY_BUILD}/control.tar.gz" -C "${XRAY_BUILD}/control" .
           tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/xray-core_${XRAY_VER}-1_${ARCH}.ipk" -C "${XRAY_BUILD}" debian-binary control.tar.gz data.tar.gz
 
-          # 2.4 下载 OpenWrt 22.03.4 用户态依赖与 shadowsocks-libev
+          # 2.4 下载 OpenWrt 22.03.4 用户态依赖与 shadowsocks-libev（不打包 curl，直接复用系统原厂 curl）
           BASE_FEED="https://archive.openwrt.org/releases/${OPENWRT_VER}/packages/${ARCH}"
           curl -fSL "${BASE_FEED}/base/Packages" -o "${IDX_DIR}/base.idx"
           curl -fSL "${BASE_FEED}/packages/Packages" -o "${IDX_DIR}/packages.idx"
@@ -240,7 +240,6 @@ jobs:
           }
 
           for pkg in ipset luci-lib-jsonc luci-compat coreutils-base64 \
-                     curl ca-bundle ca-certificates \
                      shadowsocks-libev-ss-local shadowsocks-libev-ss-redir \
                      libev libsodium libudns libpcre libmbedtls12; do
             fetch_ipk "$pkg"
@@ -276,7 +275,6 @@ jobs:
 
           echo "=========================================================="
           echo " 安装完成！后台路径: 服务 -> ShadowSocksR Plus+"
-          echo " luci-app-ssr-plus 与 xray-core 均已注册至 系统 -> 软件包"
           echo "=========================================================="
           EOF
 
@@ -300,6 +298,6 @@ jobs:
             - **目标硬件**：MT7621 (`mipsel_24kc`)
             - **目标系统**：OpenWrt 22.03 / GL.iNet 4.x（原生 `fw4` / `iptables-nft` + `ipset`）
             - **集成核心**：`shadowsocks-libev` + `xray-core` `${{ env.XRAY_VER }}`
-            - **已注册软件包**：`luci-app-ssr-plus`、`xray-core`、`shadowsocks-libev-ss-local`、`shadowsocks-libev-ss-redir`（全部支持后台一键卸载）。
+            - **内置特性**：内置简体中文语言包（`.lmo`）、内置 `url.lua` 订阅解码、复用原厂 `curl`（防动态库冲突）、全部组件标准 `.ipk` 注册（支持后台一键卸载）。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
