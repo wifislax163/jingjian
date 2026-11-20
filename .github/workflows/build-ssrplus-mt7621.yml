@@ -24,9 +24,12 @@ jobs:
       - name: 1. 安装构建依赖并编译 po2lmo
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl tar unzip jq makeself gcc make
-          curl -fSL "https://raw.githubusercontent.com/openwrt/luci/openwrt-22.03/modules/luci-base/src/po2lmo.c" -o /tmp/po2lmo.c
-          gcc /tmp/po2lmo.c -o /usr/local/bin/po2lmo
+          sudo apt-get install -y curl tar unzip jq makeself gcc
+          LUCI_SRC="https://raw.githubusercontent.com/openwrt/luci/openwrt-22.03/modules/luci-base/src"
+          curl -fSL "${LUCI_SRC}/po2lmo.c" -o /tmp/po2lmo.c
+          curl -fSL "${LUCI_SRC}/template_lmo.c" -o /tmp/template_lmo.c
+          curl -fSL "${LUCI_SRC}/template_lmo.h" -o /tmp/template_lmo.h
+          gcc /tmp/po2lmo.c /tmp/template_lmo.c -I/tmp -o /usr/local/bin/po2lmo
 
       - name: 2. 裁剪 luci-app-ssr-plus（含简体中文语言包）并封装标准 IPK
         env:
