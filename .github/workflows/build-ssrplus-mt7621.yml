@@ -21,16 +21,12 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 安装构建依赖并编译 po2lmo
+      - name: 1. 安装构建依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl tar unzip jq makeself gcc
-          # 使用独立单文件版 po2lmo.c（无额外头文件依赖，生成的 .lmo 格式全版本通用）
-          curl -fSL "https://raw.githubusercontent.com/openwrt/luci/openwrt-19.07/modules/luci-base/src/po2lmo.c" -o /tmp/po2lmo.c
-          gcc /tmp/po2lmo.c -o /usr/local/bin/po2lmo
-          po2lmo --help >/dev/null 2>&1 || true
+          sudo apt-get install -y curl tar unzip jq makeself python3
 
-      - name: 2. 裁剪 luci-app-ssr-plus（含简体中文语言包）并封装标准 IPK
+      - name: 2. 裁剪 luci-app-ssr-plus（内置 Python 生成简体中文 .lmo）并封装 IPK
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -52,11 +48,93 @@ jobs:
           cp -rf "${SRC_SSR}/root/"* "${DST_DATA}/"
           cp -rf "${SRC_SSR}/luasrc/"* "${DST_DATA}/usr/lib/lua/luci/"
 
-          # 编译简体中文翻译文件 (.po -> .lmo)
-          if [ -f "${SRC_SSR}/po/zh-cn/ssr-plus.po" ]; then
-            po2lmo "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${DST_DATA}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo"
-            ls -lh "${DST_DATA}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo"
-          fi
+          # 使用 Python 直接将 .po 编译为标准 LuCI .lmo 二进制文件（零外部依赖）
+          python3 - "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${DST_DATA}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo" << 'PYEOF'
+          import sys, struct, re
+
+          def sfh_hash(data):
+              length = len(data)
+              if length == 0:
+                  return 0
+              h = length & 0xFFFFFFFF
+              rem = length & 3
+              n = length >> 2
+              idx = 0
+              for _ in range(n):
+                  h = (h + (data[idx] | (data[idx+1] << 8))) & 0xFFFFFFFF
+                  tmp = (((data[idx+2] | (data[idx+3] << 8)) << 11) ^ h) & 0xFFFFFFFF
+                  h = ((h << 16) ^ tmp) & 0xFFFFFFFF
+                  h = (h + (h >> 11)) & 0xFFFFFFFF
+                  idx += 4
+              if rem == 3:
+                  h = (h + (data[idx] | (data[idx+1] << 8))) & 0xFFFFFFFF
+                  h = (h ^ (h << 16)) & 0xFFFFFFFF
+                  h = (h ^ (data[idx+2] << 18)) & 0xFFFFFFFF
+                  h = (h + (h >> 11)) & 0xFFFFFFFF
+              elif rem == 2:
+                  h = (h + (data[idx] | (data[idx+1] << 8))) & 0xFFFFFFFF
+                  h = (h ^ (h << 11)) & 0xFFFFFFFF
+                  h = (h + (h >> 17)) & 0xFFFFFFFF
+              elif rem == 1:
+                  h = (h + data[idx]) & 0xFFFFFFFF
+                  h = (h ^ (h << 10)) & 0xFFFFFFFF
+                  h = (h + (h >> 1)) & 0xFFFFFFFF
+              h = (h ^ (h << 3)) & 0xFFFFFFFF
+              h = (h + (h >> 5)) & 0xFFFFFFFF
+              h = (h ^ (h << 4)) & 0xFFFFFFFF
+              h = (h + (h >> 17)) & 0xFFFFFFFF
+              h = (h ^ (h << 25)) & 0xFFFFFFFF
+              h = (h + (h >> 6)) & 0xFFFFFFFF
+              return h
+
+          def unescape(s):
+              return s.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+
+          po_file, lmo_file = sys.argv[1], sys.argv[2]
+          entries = {}
+          cur_id, cur_str, mode = [], [], None
+          with open(po_file, 'r', encoding='utf-8') as f:
+              for line in f:
+                  line = line.strip()
+                  if line.startswith('msgid '):
+                      if cur_id and cur_str:
+                          k = unescape(''.join(cur_id))
+                          v = unescape(''.join(cur_str))
+                          if k and v:
+                              entries[k] = v
+                      cur_id, cur_str, mode = [line[7:-1]], [], 'id'
+                  elif line.startswith('msgstr '):
+                      cur_str, mode = [line[8:-1]], 'str'
+                  elif line.startswith('"') and line.endswith('"'):
+                      if mode == 'id':
+                          cur_id.append(line[1:-1])
+                      elif mode == 'str':
+                          cur_str.append(line[1:-1])
+              if cur_id and cur_str:
+                  k = unescape(''.join(cur_id))
+                  v = unescape(''.join(cur_str))
+                  if k and v:
+                      entries[k] = v
+
+          out = bytearray()
+          index = []
+          for k, v in entries.items():
+              vb = v.encode('utf-8')
+              offset = len(out)
+              out.extend(vb)
+              pad = (4 - (len(vb) % 4)) % 4
+              out.extend(b'\x00' * pad)
+              index.append((sfh_hash(k.encode('utf-8')), 0xFFFFFFFF, offset, len(vb)))
+
+          index.sort(key=lambda x: x[0])
+          idx_offset = len(out)
+          for rec in index:
+              out.extend(struct.pack('>IIII', *rec))
+          out.extend(struct.pack('>I', idx_offset))
+          with open(lmo_file, 'wb') as f:
+              f.write(out)
+          print(f"Generated {lmo_file}: {len(index)} entries, {len(out)} bytes")
+          PYEOF
 
           # 删除服务端与冗余规则，保留完整 controller 语法结构
           rm -f "${DST_DATA}/usr/lib/lua/luci/model/cbi/shadowsocksr/server.lua" \
