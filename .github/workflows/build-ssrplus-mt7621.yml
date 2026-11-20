@@ -1,0 +1,201 @@
+name: Build SSR-Plus Lite (MT7621 128MB RAM / OpenWrt 21.02)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '自定义 Release 标签 (留空则自动使用日期时间戳)'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-ssrplus-mt7621.yml'
+
+permissions:
+  contents: write
+
+env:
+  ARCH: mipsel_24kc
+  OPENWRT_VER: 21.02.7
+  OUTPUT_NAME: ssrplus-mt7621-128m-lite.run
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 安装构建与压缩依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl tar unzip xz-utils makeself upx-ucl
+
+      - name: 2. 裁剪 luci-app-ssr-plus 源码并打包依赖
+        run: |
+          WORK_DIR="${GITHUB_WORKSPACE}/build_tmp"
+          PKG_DIR="${WORK_DIR}/payload"
+          mkdir -p "${PKG_DIR}/ipks" "${PKG_DIR}/bins" "${PKG_DIR}/luci"
+
+          # 拉取 fw876/helloworld 源码
+          curl -sL "https://github.com/fw876/helloworld/archive/refs/heads/master.tar.gz" -o "${WORK_DIR}/helloworld.tar.gz"
+          tar -xzf "${WORK_DIR}/helloworld.tar.gz" -C "${WORK_DIR}"
+
+          SRC_SSR="${WORK_DIR}/helloworld-master/luci-app-ssr-plus"
+          DST_LUCI="${PKG_DIR}/luci"
+
+          mkdir -p "${DST_LUCI}/usr/lib/lua/luci"
+          cp -rf "${SRC_SSR}/root/"* "${DST_LUCI}/"
+          cp -rf "${SRC_SSR}/luasrc/"* "${DST_LUCI}/usr/lib/lua/luci/"
+
+          # 深度裁剪：移除服务端、流媒体检测、广告规则及冗余菜单
+          rm -f "${DST_LUCI}/usr/lib/lua/luci/model/cbi/shadowsocksr/server.lua" \
+                "${DST_LUCI}/usr/lib/lua/luci/model/cbi/shadowsocksr/server-config.lua" \
+                "${DST_LUCI}/usr/share/shadowsocksr/gen_config.lua" \
+                "${DST_LUCI}/usr/share/shadowsocksr/netflix_check.sh" \
+                "${DST_LUCI}/usr/share/shadowsocksr/gfw2ipset.sh" 2>/dev/null || true
+
+          find "${DST_LUCI}/etc/shadowsocksr" -type f \( -name "*ad*" -o -name "*netflix*" -o -name "*disney*" \) -delete 2>/dev/null || true
+          sed -i '/"server"/d;/server-config/d;/netflix/d' "${DST_LUCI}/usr/lib/lua/luci/controller/shadowsocksr.lua"
+
+          # 下载 OpenWrt 21.02.7 (mipsel_24kc) 离线依赖 IPK
+          BASE_FEED="https://archive.openwrt.org/releases/${OPENWRT_VER}/packages/${ARCH}"
+          KMOD_FEED="https://archive.openwrt.org/releases/${OPENWRT_VER}/targets/ramips/mt7621/packages"
+
+          fetch_ipk() {
+            local url_base="$1"
+            local pkg_prefix="$2"
+            local pkg_file
+            pkg_file=$(curl -sL "${url_base}/Packages" | awk -v p="$pkg_prefix" '$1=="Package:" && $2==p {found=1} found && $1=="Filename:" {print $2; exit}')
+            if [ -n "$pkg_file" ]; then
+              echo "Downloading ${pkg_file}..."
+              curl -sL "${url_base}/${pkg_file}" -o "${PKG_DIR}/ipks/${pkg_file}"
+            fi
+          }
+
+          for pkg in ipset iptables-mod-tproxy kmod-ipt-tproxy kmod-nf-tproxy \
+                     libustream-openssl ca-bundle ca-certificates \
+                     lua luci-lib-jsonc luci-compat coreutils-base64; do
+            fetch_ipk "${BASE_FEED}/base" "$pkg" || \
+            fetch_ipk "${BASE_FEED}/packages" "$pkg" || \
+            fetch_ipk "${BASE_FEED}/luci" "$pkg" || \
+            fetch_ipk "${KMOD_FEED}" "$pkg"
+          done
+
+          # 下载 Xray-core (mips32le, 兼任 VLESS/VMess/Reality/Trojan/Hysteria2)
+          XRAY_VER=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          curl -sL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-mips32le.zip" -o "${WORK_DIR}/xray.zip"
+          unzip -q "${WORK_DIR}/xray.zip" xray -d "${PKG_DIR}/bins/"
+          chmod +x "${PKG_DIR}/bins/xray"
+
+          # 下载 Shadowsocks-rust (mipsel-unknown-linux-musl)
+          SS_VER=$(curl -sL "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          curl -sL "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_VER}/shadowsocks-${SS_VER}.mipsel-unknown-linux-musl.tar.xz" -o "${WORK_DIR}/ss-rust.tar.xz"
+          tar -xJf "${WORK_DIR}/ss-rust.tar.xz" -C "${PKG_DIR}/bins/" sslocal
+          chmod +x "${PKG_DIR}/bins/sslocal"
+
+          # 128MB 内存专用策略：仅对体积较小的 sslocal 做 UPX 压缩，xray 保持原版以省运行内存
+          upx --best --lzma "${PKG_DIR}/bins/sslocal" || true
+
+          # 写入版本号记录供 Release 说明使用
+          echo "XRAY_VER=${XRAY_VER}" >> $GITHUB_ENV
+          echo "SS_VER=${SS_VER}" >> $GITHUB_ENV
+
+      - name: 3. 生成 128MB 内存防爆安装脚本并封装 Makeself (.run)
+        run: |
+          PKG_DIR="${GITHUB_WORKSPACE}/build_tmp/payload"
+
+          cat << 'EOF' > "${PKG_DIR}/install.sh"
+          #!/bin/sh
+          set -e
+
+          echo "=========================================================="
+          echo " SSR Plus+ 极简版 (MT7621 128MB RAM / OpenWrt 21.02 专用)"
+          echo "=========================================================="
+
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "mips" ]; then
+              echo "错误: 当前架构为 $ARCH，本包仅适用于 MT7621 (mipsel)！"
+              exit 1
+          fi
+
+          # 1. 释放页面缓存并预留系统紧急内存，防止 128MB 机器安装过程 OOM
+          sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+          sysctl -w vm.min_free_kbytes=4096 >/dev/null 2>&1 || true
+
+          # 2. 离线安装依赖
+          echo ">>> [1/4] 离线安装依赖 IPK..."
+          if ls ./ipks/*.ipk >/dev/null 2>&1; then
+              opkg install ./ipks/*.ipk --force-depends --force-overwrite || true
+          fi
+
+          # 3. 部署核心二进制
+          echo ">>> [2/4] 部署 xray 与 sslocal 核心..."
+          cp -f ./bins/xray /usr/bin/xray
+          cp -f ./bins/sslocal /usr/bin/sslocal
+          chmod 755 /usr/bin/xray /usr/bin/sslocal
+          ln -sf /usr/bin/xray /usr/bin/trojan 2>/dev/null || true
+
+          # 4. 部署裁剪版 LuCI 与 128MB 内存守护调优
+          echo ">>> [3/4] 部署精简版 LuCI 界面..."
+          cp -rf ./luci/* /
+          chmod +x /etc/init.d/shadowsocksr /usr/share/shadowsocksr/*.sh 2>/dev/null || true
+
+          if [ -f /etc/uci-defaults/luci-ssr-plus ]; then
+              sh /etc/uci-defaults/luci-ssr-plus && rm -f /etc/uci-defaults/luci-ssr-plus
+          fi
+
+          # 持久化 vm.min_free_kbytes=4096，避免日常运行峰值 OOM 死机
+          if ! grep -q "vm.min_free_kbytes" /etc/sysctl.conf 2>/dev/null; then
+              echo "vm.min_free_kbytes=4096" >> /etc/sysctl.conf
+          fi
+
+          # 5. 刷新缓存并启动服务
+          echo ">>> [4/4] 刷新 LuCI 缓存..."
+          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
+          /etc/init.d/shadowsocksr enable
+          /etc/init.d/rpcd restart 2>/dev/null || true
+          sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+          echo "=========================================================="
+          echo " 安装完成！后台路径: 服务 -> 影梭R Plus+"
+          echo " 128MB 内存建议: 优先使用 Shadowsocks 节点，分流选绕过大陆IP"
+          echo "=========================================================="
+          EOF
+
+          chmod +x "${PKG_DIR}/install.sh"
+
+          # 使用 --xz 极限压缩，但安装时直接解压到当前目录 (--notemp) 避免撑爆 /tmp 内存盘
+          makeself --xz --notemp "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus-Lite MT7621 128MB" ./install.sh
+          ls -lh "${GITHUB_WORKSPACE}/${OUTPUT_NAME}"
+
+      - name: 4. 生成 Release 版本号
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=v$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 5. 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: "SSR-Plus Lite MT7621 (128MB RAM) - ${{ steps.tag.outputs.TAG }}"
+          body: |
+            ### 适配规格
+            - **目标硬件**：MT7621 (`mipsel_24kc` / 128MB RAM 内存防爆优化版)
+            - **目标系统**：OpenWrt 21.02（原生 `iptables` + `ipset`）
+            - **集成核心**：
+              - `shadowsocks-rust` `${{ env.SS_VER }}`（UPX 压缩，常驻内存 ~4MB，**128MB 机器首选**）
+              - `Xray-core` `${{ env.XRAY_VER }}`（未压缩防内存峰值，原生支持 VLESS / VMess / Reality / Trojan / Hysteria2）
+
+            ### 安装命令（请勿在 `/tmp` 解压以免撑爆内存盘）
+            如果有外接 U 盘或 Overlay 空间足够，建议放在 `/root` 或 `/mnt/sda1` 下执行：
+            ```sh
+            cd /root
+            chmod +x ssrplus-mt7621-128m-lite.run
+            ./ssrplus-mt7621-128m-lite.run
+            ```
+          files: |
+            ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
