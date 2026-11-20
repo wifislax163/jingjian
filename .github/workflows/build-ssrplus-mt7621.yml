@@ -143,10 +143,9 @@ jobs:
               f.write(out)
           PYEOF
 
-          # 删除服务端与冗余规则
+          # 删除服务端与冗余规则（务必保留 gen_config.lua 用于生成 Xray 节点配置）
           rm -f "${DST_SSR}/usr/lib/lua/luci/model/cbi/shadowsocksr/server.lua" \
                 "${DST_SSR}/usr/lib/lua/luci/model/cbi/shadowsocksr/server-config.lua" \
-                "${DST_SSR}/usr/share/shadowsocksr/gen_config.lua" \
                 "${DST_SSR}/usr/share/shadowsocksr/netflix_check.sh" \
                 "${DST_SSR}/usr/share/shadowsocksr/gfw2ipset.sh" 2>/dev/null || true
 
@@ -192,12 +191,20 @@ jobs:
           tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/control.tar.gz" -C "${SSR_BUILD}/control" .
           tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_1.0-${SSR_REV}-lite_all.ipk" -C "${SSR_BUILD}" debian-binary control.tar.gz data.tar.gz
 
-          # 2.3 获取 Xray-core 并封装为标准 xray-core IPK
+          # 2.3 获取 Xray-core（优先软浮点版，解决 MT7621 无 FPU 报 Illegal instruction）
           XRAY_JSON=$(curl -fSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/XTLS/Xray-core/releases/latest")
           XRAY_VER=$(echo "$XRAY_JSON" | jq -r '.tag_name' | sed 's/^v//')
-          XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le\\.zip$")) | .browser_download_url' | head -n 1)
+          XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le-softfloat\\.zip$")) | .browser_download_url' | head -n 1)
+          if [ -z "$XRAY_URL" ]; then
+            XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le\\.zip$")) | .browser_download_url' | head -n 1)
+          fi
           curl -fSL "$XRAY_URL" -o "${WORK_DIR}/xray.zip"
-          unzip -q "${WORK_DIR}/xray.zip" xray -d "${XRAY_BUILD}/data/usr/bin/"
+          if unzip -l "${WORK_DIR}/xray.zip" | grep -q "xray_softfloat"; then
+            unzip -q "${WORK_DIR}/xray.zip" xray_softfloat -d "${XRAY_BUILD}/data/usr/bin/"
+            mv "${XRAY_BUILD}/data/usr/bin/xray_softfloat" "${XRAY_BUILD}/data/usr/bin/xray"
+          else
+            unzip -q "${WORK_DIR}/xray.zip" xray -d "${XRAY_BUILD}/data/usr/bin/"
+          fi
           chmod 755 "${XRAY_BUILD}/data/usr/bin/xray"
           ln -sf /usr/bin/xray "${XRAY_BUILD}/data/usr/bin/trojan"
 
@@ -208,7 +215,7 @@ jobs:
           Maintainer: custom-lite
           Section: net
           Priority: optional
-          Description: Xray-core binary (VLESS/VMess/Reality/Trojan/Hy2) for MT7621
+          Description: Xray-core softfloat binary (VLESS/VMess/Reality/Trojan/Hy2) for MT7621
           EOF
           sed -i 's/^          //' "${XRAY_BUILD}/control/control"
 
@@ -241,7 +248,7 @@ jobs:
             done
           }
 
-          for pkg in ipset luci-lib-jsonc luci-compat coreutils-base64 \
+          for pkg in ipset luci-lib-jsonc luci-compat coreutils coreutils-base64 \
                      shadowsocks-libev-ss-local shadowsocks-libev-ss-redir \
                      libev libsodium libudns libpcre libmbedtls12; do
             fetch_ipk "$pkg"
@@ -306,9 +313,9 @@ jobs:
           name: "SSR-Plus Lite zh-CN MT7621 (Latest)"
           body: |
             - **构建时间**：`${{ env.BUILD_TIME }}`
-            - **目标硬件**：MT7621 (`mipsel_24kc`)
+            - **目标硬件**：MT7621 (`mipsel_24kc` / Softfloat)
             - **目标系统**：OpenWrt 22.03 / GL.iNet 4.x（原生 `fw4` / `iptables-nft` + `kmod-nft-socket` + `ipset`）
-            - **集成核心**：`shadowsocks-libev` + `xray-core` `${{ env.XRAY_VER }}`
-            - **内置特性**：内置简体中文语言包（`.lmo`）、内置并校验 `url.lua`、保护并自愈原厂 `curl`、全部组件标准 `.ipk` 注册（支持后台一键卸载）。
+            - **集成核心**：`shadowsocks-libev` + `xray-core` `${{ env.XRAY_VER }}`（软浮点版）
+            - **内置特性**：内置简体中文语言包（`.lmo`）、保留 `gen_config.lua`、内置并校验 `url.lua`、保护并自愈原厂 `curl`、全部组件标准 `.ipk` 注册（支持后台一键卸载）。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
