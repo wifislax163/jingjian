@@ -1,4 +1,4 @@
-name: Build SSR-Plus Lite (MT7621 / GL.iNet 4.x & OpenWrt 22.03)
+name: Build SSR-Plus Lite (MT7621 / OpenWrt 22.03)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl tar unzip jq makeself
 
-      - name: 2. 裁剪 luci-app-ssr-plus 源码并打包用户态依赖
+      - name: 2. 裁剪 luci-app-ssr-plus 并封装标准 IPK + 用户态依赖
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -38,29 +38,69 @@ jobs:
           WORK_DIR="${GITHUB_WORKSPACE}/build_tmp"
           PKG_DIR="${WORK_DIR}/payload"
           IDX_DIR="${WORK_DIR}/indices"
-          mkdir -p "${PKG_DIR}/ipks" "${PKG_DIR}/bins" "${PKG_DIR}/luci" "${IDX_DIR}"
+          IPK_BUILD="${WORK_DIR}/ipk_build"
+          mkdir -p "${PKG_DIR}/ipks" "${PKG_DIR}/bins" "${IDX_DIR}" "${IPK_BUILD}/data/usr/lib/lua/luci" "${IPK_BUILD}/control"
 
-          # 拉取并裁剪 luci-app-ssr-plus
+          # 2.1 拉取并深度裁剪 luci-app-ssr-plus 源码
           curl -fSL "https://github.com/fw876/helloworld/archive/refs/heads/master.tar.gz" -o "${WORK_DIR}/helloworld.tar.gz"
           tar -xzf "${WORK_DIR}/helloworld.tar.gz" -C "${WORK_DIR}"
 
           SRC_SSR="${WORK_DIR}/helloworld-master/luci-app-ssr-plus"
-          DST_LUCI="${PKG_DIR}/luci"
+          DST_DATA="${IPK_BUILD}/data"
 
-          mkdir -p "${DST_LUCI}/usr/lib/lua/luci"
-          cp -rf "${SRC_SSR}/root/"* "${DST_LUCI}/"
-          cp -rf "${SRC_SSR}/luasrc/"* "${DST_LUCI}/usr/lib/lua/luci/"
+          cp -rf "${SRC_SSR}/root/"* "${DST_DATA}/"
+          cp -rf "${SRC_SSR}/luasrc/"* "${DST_DATA}/usr/lib/lua/luci/"
 
-          rm -f "${DST_LUCI}/usr/lib/lua/luci/model/cbi/shadowsocksr/server.lua" \
-                "${DST_LUCI}/usr/lib/lua/luci/model/cbi/shadowsocksr/server-config.lua" \
-                "${DST_LUCI}/usr/share/shadowsocksr/gen_config.lua" \
-                "${DST_LUCI}/usr/share/shadowsocksr/netflix_check.sh" \
-                "${DST_LUCI}/usr/share/shadowsocksr/gfw2ipset.sh" 2>/dev/null || true
+          # 删除服务端与冗余规则，保留完整 controller 语法结构
+          rm -f "${DST_DATA}/usr/lib/lua/luci/model/cbi/shadowsocksr/server.lua" \
+                "${DST_DATA}/usr/lib/lua/luci/model/cbi/shadowsocksr/server-config.lua" \
+                "${DST_DATA}/usr/share/shadowsocksr/gen_config.lua" \
+                "${DST_DATA}/usr/share/shadowsocksr/netflix_check.sh" \
+                "${DST_DATA}/usr/share/shadowsocksr/gfw2ipset.sh" 2>/dev/null || true
 
-          find "${DST_LUCI}/etc/shadowsocksr" -type f \( -name "*ad*" -o -name "*netflix*" -o -name "*disney*" \) -delete 2>/dev/null || true
-          sed -i '/"server"/d;/server-config/d;/netflix/d' "${DST_LUCI}/usr/lib/lua/luci/controller/shadowsocksr.lua"
+          find "${DST_DATA}/etc/shadowsocksr" -type f \( -name "*ad*" -o -name "*netflix*" -o -name "*disney*" \) -delete 2>/dev/null || true
 
-          # 仅下载与内核无关的用户态 IPK (OpenWrt 22.03.4 mipsel_24kc)
+          # 2.2 构建标准 luci-app-ssr-plus_lite_all.ipk（确保后台“软件包”可见且支持一键卸载）
+          SSR_REV=$(date +'%Y%m%d')
+          cat << EOF > "${IPK_BUILD}/control/control"
+          Package: luci-app-ssr-plus
+          Version: 1.0-${SSR_REV}-lite
+          Architecture: all
+          Maintainer: custom-lite
+          Section: luci
+          Priority: optional
+          Description: Lightweight ShadowSocksR Plus+ for MT7621
+          EOF
+          sed -i 's/^          //' "${IPK_BUILD}/control/control"
+
+          cat << 'EOF' > "${IPK_BUILD}/control/postinst"
+          #!/bin/sh
+          [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+          chmod +x /etc/init.d/shadowsocksr /usr/share/shadowsocksr/*.sh 2>/dev/null || true
+          if [ -f /etc/uci-defaults/luci-ssr-plus ]; then
+              sh /etc/uci-defaults/luci-ssr-plus && rm -f /etc/uci-defaults/luci-ssr-plus
+          fi
+          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
+          /etc/init.d/shadowsocksr enable 2>/dev/null || true
+          exit 0
+          EOF
+          sed -i 's/^          //' "${IPK_BUILD}/control/postinst"
+
+          cat << 'EOF' > "${IPK_BUILD}/control/prerm"
+          #!/bin/sh
+          /etc/init.d/shadowsocksr stop 2>/dev/null || true
+          /etc/init.d/shadowsocksr disable 2>/dev/null || true
+          exit 0
+          EOF
+          sed -i 's/^          //' "${IPK_BUILD}/control/prerm"
+          chmod 755 "${IPK_BUILD}/control/postinst" "${IPK_BUILD}/control/prerm"
+
+          echo "2.0" > "${IPK_BUILD}/debian-binary"
+          tar --numeric-owner --owner=0 --group=0 -czf "${IPK_BUILD}/data.tar.gz" -C "${IPK_BUILD}/data" .
+          tar --numeric-owner --owner=0 --group=0 -czf "${IPK_BUILD}/control.tar.gz" -C "${IPK_BUILD}/control" .
+          tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_1.0-${SSR_REV}-lite_all.ipk" -C "${IPK_BUILD}" debian-binary control.tar.gz data.tar.gz
+
+          # 2.3 下载 OpenWrt 22.03.4 (mipsel_24kc) 用户态依赖与 shadowsocks-libev
           BASE_FEED="https://archive.openwrt.org/releases/${OPENWRT_VER}/packages/${ARCH}"
           curl -fSL "${BASE_FEED}/base/Packages" -o "${IDX_DIR}/base.idx"
           curl -fSL "${BASE_FEED}/packages/Packages" -o "${IDX_DIR}/packages.idx"
@@ -77,6 +117,7 @@ jobs:
               url_base="${pair##*|}"
               pkg_file=$(awk -v p="$pkg_name" '$1=="Package:" && $2==p {found=1; next} found && $1=="Filename:" {print $2; exit} found && /^$/ {found=0}' "$idx_file")
               if [ -n "$pkg_file" ]; then
+                echo "  -> Downloading ${pkg_file}"
                 curl -fSL "${url_base}/${pkg_file}" -o "${PKG_DIR}/ipks/${pkg_file}"
                 return 0
               fi
@@ -89,7 +130,7 @@ jobs:
             fetch_ipk "$pkg"
           done
 
-          # 获取 Xray-core (mips32le)
+          # 2.4 获取 Xray-core (mips32le, 兼任 VLESS / VMess / Reality / Trojan / Hysteria2)
           XRAY_JSON=$(curl -fSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/XTLS/Xray-core/releases/latest")
           XRAY_VER=$(echo "$XRAY_JSON" | jq -r '.tag_name')
           XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le\\.zip$")) | .browser_download_url' | head -n 1)
@@ -98,7 +139,7 @@ jobs:
           chmod +x "${PKG_DIR}/bins/xray"
           echo "XRAY_VER=${XRAY_VER}" >> "$GITHUB_ENV"
 
-      - name: 3. 生成兼容脚本并封装 Makeself (--gzip)
+      - name: 3. 生成安装脚本并封装 Makeself (--gzip)
         run: |
           set -euo pipefail
           PKG_DIR="${GITHUB_WORKSPACE}/build_tmp/payload"
@@ -108,42 +149,35 @@ jobs:
           set -e
 
           echo "=========================================================="
-          echo " SSR Plus+ 极简版 (MT7621 / GL.iNet 4.x & OpenWrt 22.03)"
+          echo " SSR Plus+ 极简版 (MT7621 / OpenWrt 22.03 & GL.iNet 4.x)"
           echo "=========================================================="
 
           sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
-          echo ">>> [1/4] 安装用户态依赖与 shadowsocks-libev..."
-          opkg install ./ipks/*.ipk --force-depends --force-overwrite || true
-
-          echo ">>> [2/4] 匹配当前内核安装 TProxy 与 fw4 兼容组件..."
+          echo ">>> [1/3] 匹配当前内核安装 TProxy 与 fw4 兼容组件..."
           opkg update || true
           opkg install kmod-ipt-tproxy iptables-nft ipset --force-overwrite || true
 
-          echo ">>> [3/4] 部署 xray 与裁剪版 LuCI..."
+          echo ">>> [2/3] 部署 xray 核心..."
           cp -f ./bins/xray /usr/bin/xray
           chmod 755 /usr/bin/xray
           ln -sf /usr/bin/xray /usr/bin/trojan 2>/dev/null || true
 
-          cp -rf ./luci/* /
-          chmod +x /etc/init.d/shadowsocksr /usr/share/shadowsocksr/*.sh 2>/dev/null || true
+          echo ">>> [3/3] 安装裁剪版 luci-app-ssr-plus 及运行库..."
+          opkg install ./ipks/*.ipk --force-depends --force-overwrite
 
-          if [ -f /etc/uci-defaults/luci-ssr-plus ]; then
-              sh /etc/uci-defaults/luci-ssr-plus && rm -f /etc/uci-defaults/luci-ssr-plus
-          fi
-
-          echo ">>> [4/4] 刷新缓存并启用服务..."
-          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
-          /etc/init.d/shadowsocksr enable
           /etc/init.d/rpcd restart 2>/dev/null || true
+          sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
           echo "=========================================================="
-          echo " 安装完成！请进入路由器后台 -> 服务 -> 影梭R Plus+"
+          echo " 安装完成！后台路径: 服务 -> ShadowSocksR Plus+"
+          echo " 已注册至 系统 -> 软件包，支持随时一键卸载"
           echo "=========================================================="
           EOF
 
           chmod +x "${PKG_DIR}/install.sh"
           makeself --gzip --notemp "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus-Lite MT7621" ./install.sh
+          ls -lh "${GITHUB_WORKSPACE}/${OUTPUT_NAME}"
 
       - name: 4. 生成 Release 版本号
         id: tag
@@ -158,6 +192,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.TAG }}
-          name: "SSR-Plus Lite MT7621 (OpenWrt 22.03 / GL.iNet 4.x) - ${{ steps.tag.outputs.TAG }}"
+          name: "SSR-Plus Lite MT7621 (OpenWrt 22.03) - ${{ steps.tag.outputs.TAG }}"
+          body: |
+            ### 适配规格
+            - **目标硬件**：MT7621 (`mipsel_24kc`)
+            - **目标系统**：OpenWrt 22.03 / GL.iNet 4.x（原生 `fw4` / `iptables-nft` + `ipset`）
+            - **集成核心**：`shadowsocks-libev` + `Xray-core` `${{ env.XRAY_VER }}`
+            - **打包特性**：采用 `--gzip` 封装（无需安装 `xz`），并将精简版插件封装为标准 `.ipk`，安装后可在后台 **系统 -> 软件包** 中直接管理与卸载。
+
+            ### 一键安装命令
+            ```sh
+            cd /root
+            chmod +x ssrplus-mt7621-lite.run
+            ./ssrplus-mt7621-lite.run
+            rm -f ssrplus-mt7621-lite.run
+            ```
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
