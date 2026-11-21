@@ -1,4 +1,4 @@
-name: Build SSR-Plus Full Offline Deps (MT7621 / OpenWrt 22.03)
+name: Build SSR-Plus Lite (Main + zh-CN + Xray / MT7621)
 
 on:
   workflow_dispatch:
@@ -12,10 +12,7 @@ permissions:
   contents: write
 
 env:
-  ARCH: mipsel_24kc
   COOLUC_URL: https://opkg.cooluc.com/openwrt-24.10/mipsel_24kc
-  OWRT_PKG_URL: https://downloads.openwrt.org/releases/22.03.4/packages/mipsel_24kc
-  OWRT_BASE_URL: https://downloads.openwrt.org/releases/22.03.4/targets/ramips/mt7621/packages
   OUTPUT_NAME: ssrplus-mt7621-lite.run
   RELEASE_TAG: latest
 
@@ -28,106 +25,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl tar gzip makeself python3
 
-      - name: 2. 打包官方主程序/中文包 + 精准拉取全部用户态依赖与核心
+      - name: 2. 仅封装 3 个核心 IPK（官方主程序 + 中文语言包 + cooluc 最新 xray-core）
         run: |
           set -euo pipefail
           WORK_DIR="${GITHUB_WORKSPACE}/build_tmp"
           PKG_DIR="${WORK_DIR}/payload"
           SSR_BUILD="${WORK_DIR}/ssr_ipk"
           ZH_BUILD="${WORK_DIR}/zh_ipk"
-          IDX_DIR="${WORK_DIR}/indices"
 
-          mkdir -p "${PKG_DIR}/ipks" "${IDX_DIR}" \
+          mkdir -p "${PKG_DIR}/ipks" \
                    "${SSR_BUILD}/data" "${SSR_BUILD}/control" \
                    "${ZH_BUILD}/data/usr/lib/lua/luci/i18n" "${ZH_BUILD}/control"
 
-          # 2.1 下载索引表（OpenWrt 22.03.4 官方源优先匹配 LuCI/基础包，cooluc 源提供 xray-core 与代理组件）
-          curl -fsSL "${COOLUC_URL}/Packages.gz" | gunzip > "${IDX_DIR}/cooluc.idx"
-          for feed in base luci packages routing; do
-            curl -fsSL "${OWRT_PKG_URL}/${feed}/Packages.gz" | gunzip > "${IDX_DIR}/${feed}.idx"
-          done
-          curl -fsSL "${OWRT_BASE_URL}/Packages.gz" | gunzip > "${IDX_DIR}/target.idx"
+          # 2.1 从 cooluc 源拉取最新版 xray-core IPK（净化文件名中的 ~）
+          curl -fsSL "${COOLUC_URL}/Packages.gz" | gunzip > "${WORK_DIR}/cooluc.idx"
 
-          python3 - "${IDX_DIR}" "${PKG_DIR}/ipks" "${COOLUC_URL}" "${OWRT_PKG_URL}" "${OWRT_BASE_URL}" << 'PYEOF'
+          python3 - "${WORK_DIR}/cooluc.idx" "${PKG_DIR}/ipks" "${COOLUC_URL}" << 'PYEOF'
           import sys, os, re, urllib.request
 
-          idx_dir, out_dir, cooluc_url, owrt_pkg_url, owrt_base_url = sys.argv[1:6]
-
-          sources = [
-              ("luci.idx", f"{owrt_pkg_url}/luci"),
-              ("packages.idx", f"{owrt_pkg_url}/packages"),
-              ("base.idx", f"{owrt_pkg_url}/base"),
-              ("routing.idx", f"{owrt_pkg_url}/routing"),
-              ("target.idx", owrt_base_url),
-              ("cooluc.idx", cooluc_url),
-          ]
-
-          SKIP_PKGS = {
-              "libc", "libgcc1", "libpthread", "librt", "zlib",
-              "kernel", "base-files", "busybox", "uci", "ubus", "ubox", "rpcd",
-              "uhttpd", "luci-base", "luci-mod-admin-full", "luci-lua-runtime",
-              "lua", "libuci-lua", "libubus-lua", "libnixio", "ca-bundle", "ca-certificates",
-              "curl", "libcurl4", "libmbedtls12", "libnghttp2-14", "ipset", "libipset13", "libmnl0"
-          }
-
+          idx_file, out_dir, base_url = sys.argv[1:4]
           pkg_map = {}
-          for fname, base_url in sources:
-              fpath = os.path.join(idx_dir, fname)
-              if not os.path.exists(fpath):
-                  continue
-              cur = {}
-              with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                  for line in f:
-                      line = line.rstrip("\n")
-                      if not line:
-                          if "Package" in cur and "Filename" in cur:
-                              name = cur["Package"]
-                              if name not in pkg_map:
-                                  pkg_map[name] = (base_url, cur["Filename"], cur.get("Depends", ""))
-                          cur = {}
-                      elif ": " in line:
-                          k, v = line.split(": ", 1)
-                          cur[k] = v
+          cur = {}
+          with open(idx_file, "r", encoding="utf-8", errors="ignore") as f:
+              for line in f:
+                  line = line.rstrip("\n")
+                  if not line:
+                      if "Package" in cur and "Filename" in cur:
+                          pkg_map[cur["Package"]] = cur["Filename"]
+                      cur = {}
+                  elif ": " in line:
+                      k, v = line.split(": ", 1)
+                      cur[k] = v
 
-          ROOT_DEPS = [
-              "xray-core",
-              "luci-compat",
-              "luci-lib-ipkg",
-              "luci-lib-jsonc",
-              "lua-neturl",
-              "lyaml",
-              "coreutils-base64",
-              "resolveip",
-              "ipt2socks",
-              "dns2tcp",
-              "microsocks"
-          ]
-
-          visited = set()
-          queue = list(ROOT_DEPS)
-
-          while queue:
-              pkg = queue.pop(0).strip()
-              if not pkg or pkg in visited or pkg in SKIP_PKGS or pkg.startswith("kmod-"):
-                  continue
-              visited.add(pkg)
-              if pkg not in pkg_map:
-                  print(f"[WARN] 未在索引中找到: {pkg}")
-                  continue
-              base_url, rel_file, deps_str = pkg_map[pkg]
-              dl_url = f"{base_url}/{rel_file}"
-              safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', os.path.basename(rel_file))
-              dst_file = os.path.join(out_dir, safe_name)
-              print(f"[FETCH] {pkg} -> {safe_name}")
-              urllib.request.urlretrieve(dl_url, dst_file)
-
-              for raw_dep in deps_str.split(","):
-                  dep = raw_dep.strip().split(" ")[0].split("(")[0].strip()
-                  if dep and dep not in visited:
-                      queue.append(dep)
+          if "xray-core" not in pkg_map:
+              raise RuntimeError("未在 cooluc 源找到 xray-core")
+          rel_file = pkg_map["xray-core"]
+          safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', os.path.basename(rel_file))
+          print(f"[FETCH] xray-core -> {safe_name}")
+          urllib.request.urlretrieve(f"{base_url}/{rel_file}", os.path.join(out_dir, safe_name))
           PYEOF
 
-          # 2.2 拉取 fw876/helloworld 官方源码封装主程序与中文包
+          # 2.2 拉取 fw876/helloworld 官方源码封装主程序
           curl -fSL "https://github.com/fw876/helloworld/archive/refs/heads/master.tar.gz" -o "${WORK_DIR}/helloworld.tar.gz"
           tar -xzf "${WORK_DIR}/helloworld.tar.gz" -C "${WORK_DIR}"
 
@@ -178,7 +116,7 @@ jobs:
           tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/control.tar.gz" -C "${SSR_BUILD}/control" .
           tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_99.0-${SSR_REV}_all.ipk" -C "${SSR_BUILD}" debian-binary control.tar.gz data.tar.gz
 
-          # 2.3 编译官方简体中文 .lmo 并封装独立中文包
+          # 2.3 编译官方简体中文 .lmo 并封装独立中文语言包
           python3 - "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${ZH_BUILD}/data/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo" << 'PYEOF'
           import sys, struct
 
@@ -285,7 +223,7 @@ jobs:
           echo "PKG_LIST=$(ls -1 "${PKG_DIR}/ipks" | tr '\n' ' ')" >> "$GITHUB_ENV"
           echo "BUILD_TIME=$(date +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_ENV"
 
-      - name: 3. 生成安装脚本并封装 Makeself（含免重启热加载）
+      - name: 3. 生成安装脚本并封装 Makeself（自动拉取 cooluc 依赖后清理源并免重启热加载）
         run: |
           set -euo pipefail
           PKG_DIR="${GITHUB_WORKSPACE}/build_tmp/payload"
@@ -294,30 +232,47 @@ jobs:
           #!/bin/sh
           set -e
 
-          echo ">>> [1/4] 检查并从官方源补齐内核模块 (kmod-nft-socket / kmod-nft-tproxy)..."
-          if ! opkg list-installed | grep -q "^kmod-nft-socket " || ! opkg list-installed | grep -q "^kmod-nft-tproxy "; then
-              opkg update || true
-              opkg install kmod-nft-socket kmod-nft-tproxy
-          fi
+          FEED_FILE="/etc/opkg/customfeeds.conf"
+          FEED_LINE="src/gz cooluc_tmp https://opkg.cooluc.com/openwrt-24.10/mipsel_24kc"
 
-          echo ">>> [2/4] 离线安装全部内嵌 IPK（主程序 + 中文包 + luci-compat + luci-lib-ipkg + xray-core + 全部依赖）..."
+          cleanup() {
+              sed -i '/opkg\.cooluc\.com\/openwrt-24\.10\/mipsel_24kc/d' "${FEED_FILE}" 2>/dev/null || true
+              rm -f /var/opkg-lists/cooluc_tmp /var/opkg-lists/cooluc_tmp.sig 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          echo ">>> [1/4] 临时挂载 cooluc 软件源并更新索引..."
+          cleanup
+          mkdir -p /etc/opkg
+          touch "${FEED_FILE}"
+          if [ -s "${FEED_FILE}" ]; then
+              sed -i "1i ${FEED_LINE}" "${FEED_FILE}"
+          else
+              echo "${FEED_LINE}" > "${FEED_FILE}"
+          fi
+          sed -i 's/^option check_signature/# option check_signature/' /etc/opkg.conf 2>/dev/null || true
+          opkg update || true
+
+          echo ">>> [2/4] 安装包内 3 个核心 IPK（自动从 cooluc 拉取依赖，从官方源补齐 kmod-nft-socket）..."
           opkg install ./ipks/*.ipk --force-overwrite --force-reinstall --force-downgrade
 
-          echo ">>> [3/4] 热加载 nftables 内核模块（免重启生效）..."
+          echo ">>> [3/4] 清理临时软件源并热加载内核模块..."
+          cleanup
           for mod in nf_socket_ipv4 nf_socket_ipv6 nf_tproxy_ipv4 nf_tproxy_ipv6 nft_socket nft_tproxy; do
               modprobe "$mod" 2>/dev/null || true
           done
 
-          echo ">>> [4/4] 初始化配置并刷新 LuCI 缓存与 Web/RPC 服务..."
+          echo ">>> [4/4] 初始化配置并刷新 LuCI 缓存与服务（免重启生效）..."
           [ -f /etc/uci-defaults/luci-ssr-plus ] && sh /etc/uci-defaults/luci-ssr-plus && rm -f /etc/uci-defaults/luci-ssr-plus
           rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
           /etc/init.d/rpcd restart 2>/dev/null || true
           /etc/init.d/uhttpd reload 2>/dev/null || /etc/init.d/uhttpd restart 2>/dev/null || true
+
           echo "安装完成！无需重启路由器，刷新后台即可在：服务 -> ShadowSocksR Plus+ 中使用。"
           EOF
 
           chmod +x "${PKG_DIR}/install.sh"
-          makeself --gzip "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus Full Offline MT7621" ./install.sh
+          makeself --gzip "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus Lite MT7621" ./install.sh
 
       - name: 4. 清理旧的 Release 与 Tag
         env:
@@ -330,10 +285,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "SSR-Plus Full Offline Deps MT7621 (Latest)"
+          name: "SSR-Plus Lite (Main + zh-CN + Xray) MT7621 (Latest)"
           body: |
             - **构建时间**：`${{ env.BUILD_TIME }}`
-            - **内嵌全量 IPK**：`${{ env.PKG_LIST }}`
-            - **打包与免重启特性**：整合官方主程序与中文包、22.03.4 原版 `luci-compat` / `luci-lib-ipkg` / `luci-lib-jsonc` / `coreutils-base64` / `resolveip`、`cooluc` 源 `xray-core` 与代理组件（自动净化文件名 `~`）；安装时自动补齐 `kmod-nft-socket` / `kmod-nft-tproxy` 并热加载内核模块、重载 `rpcd` / `uhttpd`，无需重启路由器即可直接使用。
+            - **内嵌核心 IPK（仅 3 个）**：`${{ env.PKG_LIST }}`
+            - **安装逻辑**：包内仅包含官方主程序、中文语言包和 `cooluc` 源最新 `xray-core`；安装时临时置顶 `cooluc` 源由 `opkg` 自动拉取全部运行依赖，同时从官方源补齐 `kmod-nft-socket` / `kmod-nft-tproxy`，完成后自动清理临时源并热加载生效。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
