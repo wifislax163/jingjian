@@ -1,4 +1,4 @@
-name: Build SSR-Plus Lite (MT7621 / OpenWrt 22.03)
+name: Build SSR-Plus Offline Bundle (MT7621 / OpenWrt 22.03)
 
 on:
   workflow_dispatch:
@@ -13,6 +13,9 @@ permissions:
 
 env:
   ARCH: mipsel_24kc
+  COOLUC_URL: https://opkg.cooluc.com/openwrt-24.10/mipsel_24kc
+  OWRT_PKG_URL: https://downloads.openwrt.org/releases/22.03.4/packages/mipsel_24kc
+  OWRT_BASE_URL: https://downloads.openwrt.org/releases/22.03.4/targets/ramips/mt7621/packages
   OUTPUT_NAME: ssrplus-mt7621-lite.run
   RELEASE_TAG: latest
 
@@ -23,23 +26,96 @@ jobs:
       - name: 1. 安装构建工具
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl tar unzip jq makeself python3
+          sudo apt-get install -y curl tar gzip makeself python3
 
-      - name: 2. 封装标准 IPK (luci-app-ssr-plus + 软浮点 xray-core)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 2. 封装主程序 IPK 并打包全量用户态依赖（含 luci-compat）
         run: |
           set -euo pipefail
           WORK_DIR="${GITHUB_WORKSPACE}/build_tmp"
           PKG_DIR="${WORK_DIR}/payload"
           SSR_BUILD="${WORK_DIR}/ssr_ipk"
-          XRAY_BUILD="${WORK_DIR}/xray_ipk"
+          IDX_DIR="${WORK_DIR}/indices"
 
-          mkdir -p "${PKG_DIR}/ipks" \
-                   "${SSR_BUILD}/data/usr/lib/lua/luci/i18n" "${SSR_BUILD}/control" \
-                   "${XRAY_BUILD}/data/usr/bin" "${XRAY_BUILD}/control"
+          mkdir -p "${PKG_DIR}/ipks" "${IDX_DIR}" \
+                   "${SSR_BUILD}/data/usr/lib/lua/luci/i18n" "${SSR_BUILD}/control"
 
-          # 2.1 拉取 fw876/helloworld 源码（完整保留所有脚本、规则与菜单页面）
+          # 2.1 下载索引表并递归解析所有用户态依赖（含 luci-compat，跳过 kmod 留给官方源匹配内核）
+          curl -fsSL "${COOLUC_URL}/Packages.gz" | gunzip > "${IDX_DIR}/cooluc.idx"
+          for feed in base luci packages routing telephony; do
+            curl -fsSL "${OWRT_PKG_URL}/${feed}/Packages.gz" | gunzip > "${IDX_DIR}/${feed}.idx"
+          done
+          curl -fsSL "${OWRT_BASE_URL}/Packages.gz" | gunzip > "${IDX_DIR}/target.idx"
+
+          python3 - "${IDX_DIR}" "${PKG_DIR}/ipks" "${COOLUC_URL}" "${OWRT_PKG_URL}" "${OWRT_BASE_URL}" << 'PYEOF'
+          import sys, os, urllib.request
+
+          idx_dir, out_dir, cooluc_url, owrt_pkg_url, owrt_base_url = sys.argv[1:6]
+
+          sources = [
+              ("cooluc.idx", cooluc_url),
+              ("luci.idx", f"{owrt_pkg_url}/luci"),
+              ("packages.idx", f"{owrt_pkg_url}/packages"),
+              ("base.idx", f"{owrt_pkg_url}/base"),
+              ("routing.idx", f"{owrt_pkg_url}/routing"),
+              ("target.idx", owrt_base_url),
+          ]
+
+          SKIP_PKGS = {
+              "libc", "libgcc1", "libpthread", "librt", "libstdcpp6", "zlib",
+              "kernel", "base-files", "busybox", "uci", "ubus", "ubox", "rpcd",
+              "uhttpd", "luci-base", "luci-mod-admin-full", "lua", "libuci-lua",
+              "libubus-lua", "libnixio", "ca-bundle", "ca-certificates"
+          }
+
+          pkg_map = {}
+          for fname, base_url in sources:
+              fpath = os.path.join(idx_dir, fname)
+              if not os.path.exists(fpath):
+                  continue
+              cur = {}
+              with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                  for line in f:
+                      line = line.rstrip("\n")
+                      if not line:
+                          if "Package" in cur and "Filename" in cur:
+                              name = cur["Package"]
+                              if name not in pkg_map:
+                                  pkg_map[name] = (base_url, cur["Filename"], cur.get("Depends", ""))
+                          cur = {}
+                      elif ": " in line:
+                          k, v = line.split(": ", 1)
+                          cur[k] = v
+
+          ROOT_DEPS = [
+              "xray-core", "luci-compat", "luci-lib-ipkg", "luci-lua-runtime",
+              "luci-lib-jsonc", "lua-neturl", "coreutils-base64", "curl",
+              "ipset", "resolveip", "ipt2socks", "dns2tcp", "microsocks"
+          ]
+
+          visited = set()
+          queue = list(ROOT_DEPS)
+
+          while queue:
+              pkg = queue.pop(0).strip()
+              if not pkg or pkg in visited or pkg in SKIP_PKGS or pkg.startswith("kmod-"):
+                  continue
+              visited.add(pkg)
+              if pkg not in pkg_map:
+                  print(f"[WARN] 未在索引中找到: {pkg}")
+                  continue
+              base_url, rel_file, deps_str = pkg_map[pkg]
+              dl_url = f"{base_url}/{rel_file}"
+              dst_file = os.path.join(out_dir, os.path.basename(rel_file))
+              print(f"[FETCH] {pkg} -> {os.path.basename(rel_file)}")
+              urllib.request.urlretrieve(dl_url, dst_file)
+
+              for raw_dep in deps_str.split(","):
+                  dep = raw_dep.strip().split(" ")[0].split("(")[0].strip()
+                  if dep and dep not in visited:
+                      queue.append(dep)
+          PYEOF
+
+          # 2.2 拉取 fw876/helloworld 源码封装标准 luci-app-ssr-plus IPK
           curl -fSL "https://github.com/fw876/helloworld/archive/refs/heads/master.tar.gz" -o "${WORK_DIR}/helloworld.tar.gz"
           tar -xzf "${WORK_DIR}/helloworld.tar.gz" -C "${WORK_DIR}"
 
@@ -49,7 +125,6 @@ jobs:
           cp -rf "${SRC_SSR}/root/"* "${DST_SSR}/"
           cp -rf "${SRC_SSR}/luasrc/"* "${DST_SSR}/usr/lib/lua/luci/"
 
-          # 内置 url.lua 保障订阅解析
           curl -fSL "https://raw.githubusercontent.com/lunarmodules/luasocket/master/src/url.lua" -o "${DST_SSR}/usr/lib/lua/url.lua"
           test -s "${DST_SSR}/usr/lib/lua/url.lua"
           [ "$(wc -c < "${DST_SSR}/usr/lib/lua/url.lua")" -gt 5000 ]
@@ -141,21 +216,20 @@ jobs:
               f.write(out)
           PYEOF
 
-          # 2.2 生成标准 control（高版本号防被源覆盖，移除易冲突的 kmod-ipt-tproxy）
+          # 2.3 生成标准 control（用户态依赖全本地安装，kmod-nft-tproxy 自动从路由器自带官方源拉取）
           SSR_REV=$(date +'%Y%m%d.%H%M')
           cat << EOF > "${SSR_BUILD}/control/control"
           Package: luci-app-ssr-plus
           Version: 99.0-${SSR_REV}-lite
           Architecture: all
-          Depends: luci-lib-ipkg, luci-lua-runtime, luci-compat, luci-lib-jsonc, lua-neturl, coreutils-base64, curl, ipset, resolveip, ipt2socks, dns2tcp, microsocks, xray-core
+          Depends: luci-compat, luci-lib-ipkg, luci-lua-runtime, luci-lib-jsonc, lua-neturl, coreutils-base64, curl, ipset, resolveip, ipt2socks, dns2tcp, microsocks, kmod-nft-tproxy, xray-core
           Maintainer: custom-lite
           Section: luci
           Priority: optional
-          Description: Lightweight ShadowSocksR Plus+ Client (zh-cn) for MT7621
+          Description: Lightweight ShadowSocksR Plus+ Offline Bundle (zh-cn) for MT7621
           EOF
           sed -i 's/^          //' "${SSR_BUILD}/control/control"
 
-          # 原生 postinst：opkg 安装时自动初始化 UCI 默认配置、刷新菜单缓存并注册自启
           cat << 'EOF' > "${SSR_BUILD}/control/postinst"
           #!/bin/sh
           [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
@@ -183,43 +257,10 @@ jobs:
           tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/control.tar.gz" -C "${SSR_BUILD}/control" .
           tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_99.0-${SSR_REV}-lite_all.ipk" -C "${SSR_BUILD}" debian-binary control.tar.gz data.tar.gz
 
-          # 2.3 封装软浮点 xray-core IPK（适配 MT7621 无 FPU，高版本号防被源覆盖）
-          XRAY_JSON=$(curl -fSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/XTLS/Xray-core/releases/latest")
-          XRAY_VER=$(echo "$XRAY_JSON" | jq -r '.tag_name' | sed 's/^v//')
-          XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le-softfloat\\.zip$")) | .browser_download_url' | head -n 1)
-          if [ -z "$XRAY_URL" ]; then
-            XRAY_URL=$(echo "$XRAY_JSON" | jq -r '.assets[] | select(.name | test("Xray-linux-mips32le\\.zip$")) | .browser_download_url' | head -n 1)
-          fi
-          curl -fSL "$XRAY_URL" -o "${WORK_DIR}/xray.zip"
-          if unzip -l "${WORK_DIR}/xray.zip" | grep -q "xray_softfloat"; then
-            unzip -q "${WORK_DIR}/xray.zip" xray_softfloat -d "${XRAY_BUILD}/data/usr/bin/"
-            mv "${XRAY_BUILD}/data/usr/bin/xray_softfloat" "${XRAY_BUILD}/data/usr/bin/xray"
-          else
-            unzip -q "${WORK_DIR}/xray.zip" xray -d "${XRAY_BUILD}/data/usr/bin/"
-          fi
-          chmod 755 "${XRAY_BUILD}/data/usr/bin/xray"
-          ln -sf /usr/bin/xray "${XRAY_BUILD}/data/usr/bin/trojan"
-
-          cat << EOF > "${XRAY_BUILD}/control/control"
-          Package: xray-core
-          Version: ${XRAY_VER}-r99
-          Architecture: ${ARCH}
-          Maintainer: custom-lite
-          Section: net
-          Priority: optional
-          Description: Xray-core softfloat binary for MT7621
-          EOF
-          sed -i 's/^          //' "${XRAY_BUILD}/control/control"
-
-          echo "2.0" > "${XRAY_BUILD}/debian-binary"
-          tar --numeric-owner --owner=0 --group=0 -czf "${XRAY_BUILD}/data.tar.gz" -C "${XRAY_BUILD}/data" .
-          tar --numeric-owner --owner=0 --group=0 -czf "${XRAY_BUILD}/control.tar.gz" -C "${XRAY_BUILD}/control" .
-          tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/xray-core_${XRAY_VER}-r99_${ARCH}.ipk" -C "${XRAY_BUILD}" debian-binary control.tar.gz data.tar.gz
-
-          echo "XRAY_VER=v${XRAY_VER}" >> "$GITHUB_ENV"
+          echo "PKG_LIST=$(ls -1 "${PKG_DIR}/ipks" | tr '\n' ' ')" >> "$GITHUB_ENV"
           echo "BUILD_TIME=$(date +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_ENV"
 
-      - name: 3. 生成极简原生 opkg 安装脚本并封装 Makeself
+      - name: 3. 生成安装脚本并封装 Makeself（不改系统软件源）
         run: |
           set -euo pipefail
           PKG_DIR="${GITHUB_WORKSPACE}/build_tmp/payload"
@@ -228,25 +269,19 @@ jobs:
           #!/bin/sh
           set -e
 
-          echo ">>> [1/3] 写入软件源并更新索引..."
-          FEED_LINE="src/gz cooluc_mipsel https://opkg.cooluc.com/openwrt-24.10/mipsel_24kc"
-          mkdir -p /etc/opkg
-          touch /etc/opkg/customfeeds.conf
-          grep -q "opkg.cooluc.com/openwrt-24.10/mipsel_24kc" /etc/opkg/customfeeds.conf || echo "${FEED_LINE}" >> /etc/opkg/customfeeds.conf
-          sed -i 's/^option check_signature/# option check_signature/' /etc/opkg.conf 2>/dev/null || true
-          opkg update || true
+          echo ">>> [1/2] 安装内嵌全量 IPK（用户态依赖本地直装，kmod 由系统官方源自动补齐）..."
+          if ! opkg install ./ipks/*.ipk --force-overwrite --force-reinstall --force-downgrade; then
+              opkg update || true
+              opkg install ./ipks/*.ipk --force-overwrite --force-reinstall --force-downgrade
+          fi
 
-          echo ">>> [2/3] 原生安装 IPK（自动拉取 Depends 全部依赖并执行 postinst 注册）..."
-          opkg install ./ipks/xray-core_*.ipk --force-overwrite --force-reinstall --force-downgrade
-          opkg install ./ipks/luci-app-ssr-plus_*.ipk --force-overwrite --force-reinstall --force-downgrade
-
-          echo ">>> [3/3] 刷新 LuCI RPC 缓存..."
+          echo ">>> [2/2] 刷新 LuCI RPC 缓存..."
           /etc/init.d/rpcd restart 2>/dev/null || true
           echo "安装完成！请在后台：服务 -> ShadowSocksR Plus+ 更新订阅并选择节点。"
           EOF
 
           chmod +x "${PKG_DIR}/install.sh"
-          makeself --gzip "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus-Lite MT7621" ./install.sh
+          makeself --gzip "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus-Lite MT7621 Offline" ./install.sh
 
       - name: 4. 清理旧的 Release 与 Tag
         env:
@@ -259,10 +294,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "SSR-Plus Lite zh-CN MT7621 (Latest)"
+          name: "SSR-Plus Lite Offline Bundle zh-CN MT7621 (Latest)"
           body: |
             - **构建时间**：`${{ env.BUILD_TIME }}`
-            - **集成核心**：`xray-core` `${{ env.XRAY_VER }}`（软浮点 `r99`）+ `luci-app-ssr-plus`（简体中文精简版 `99.0`）
-            - **安装逻辑**：自动写入 `cooluc` 源并由 `opkg install` 原生解析 `Depends` 拉取全部依赖、执行 `postinst` 注册服务，装完自动清理临时目录。
+            - **内嵌全量 IPK**：`${{ env.PKG_LIST }}`
+            - **安装特性**：不修改路由器软件源；用户态全量依赖（含 `luci-compat`、`xray-core`）离线秒装，`kmod-nft-tproxy` 自动由固件自带官方源匹配内核安装。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
