@@ -1,4 +1,4 @@
-name: Build SSR-Plus Offline Bundle (MT7621 / OpenWrt 22.03)
+name: Build SSR-Plus Official + Cooluc Deps (MT7621 / OpenWrt 22.03)
 
 on:
   workflow_dispatch:
@@ -28,18 +28,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl tar gzip makeself python3
 
-      - name: 2. 封装主程序 IPK 并打包全量用户态依赖（含 luci-compat）
+      - name: 2. 打包官方主程序/中文包 + 从 cooluc 拉取核心与全量依赖
         run: |
           set -euo pipefail
           WORK_DIR="${GITHUB_WORKSPACE}/build_tmp"
           PKG_DIR="${WORK_DIR}/payload"
           SSR_BUILD="${WORK_DIR}/ssr_ipk"
+          ZH_BUILD="${WORK_DIR}/zh_ipk"
           IDX_DIR="${WORK_DIR}/indices"
 
           mkdir -p "${PKG_DIR}/ipks" "${IDX_DIR}" \
-                   "${SSR_BUILD}/data/usr/lib/lua/luci/i18n" "${SSR_BUILD}/control"
+                   "${SSR_BUILD}/data" "${SSR_BUILD}/control" \
+                   "${ZH_BUILD}/data/usr/lib/lua/luci/i18n" "${ZH_BUILD}/control"
 
-          # 2.1 下载索引表并递归解析所有用户态依赖（自动净化文件名中的 ~ 等非法字符）
+          # 2.1 从 cooluc 源（优先）及 OpenWrt 22.03.4 官方源递归拉取 xray-core 与全部用户态依赖
           curl -fsSL "${COOLUC_URL}/Packages.gz" | gunzip > "${IDX_DIR}/cooluc.idx"
           for feed in base luci packages routing telephony; do
             curl -fsSL "${OWRT_PKG_URL}/${feed}/Packages.gz" | gunzip > "${IDX_DIR}/${feed}.idx"
@@ -60,8 +62,9 @@ jobs:
               ("target.idx", owrt_base_url),
           ]
 
+          # 跳过系统基础库、24.10 过渡包 luci-lua-runtime 与内核模块（kmod 由路由器官方源匹配内核安装）
           SKIP_PKGS = {
-              "libc", "libgcc1", "libpthread", "librt", "libstdcpp6", "zlib",
+              "libc", "libgcc1", "libpthread", "librt", "zlib",
               "kernel", "base-files", "busybox", "uci", "ubus", "ubox", "rpcd",
               "uhttpd", "luci-base", "luci-mod-admin-full", "luci-lua-runtime",
               "lua", "libuci-lua", "libubus-lua", "libnixio", "ca-bundle", "ca-certificates"
@@ -87,8 +90,8 @@ jobs:
                           cur[k] = v
 
           ROOT_DEPS = [
-              "xray-core", "luci-compat", "luci-lib-ipkg",
-              "luci-lib-jsonc", "lua-neturl", "coreutils-base64", "curl",
+              "xray-core", "luci-compat", "luci-lib-ipkg", "luci-lib-jsonc",
+              "lua-neturl", "lyaml", "coreutils-base64", "curl",
               "ipset", "resolveip", "ipt2socks", "dns2tcp", "microsocks"
           ]
 
@@ -116,22 +119,60 @@ jobs:
                       queue.append(dep)
           PYEOF
 
-          # 2.2 拉取 fw876/helloworld 源码封装标准 luci-app-ssr-plus IPK
+          # 2.2 拉取 fw876/helloworld 官方源码
           curl -fSL "https://github.com/fw876/helloworld/archive/refs/heads/master.tar.gz" -o "${WORK_DIR}/helloworld.tar.gz"
           tar -xzf "${WORK_DIR}/helloworld.tar.gz" -C "${WORK_DIR}"
 
           SRC_SSR="${WORK_DIR}/helloworld-master/luci-app-ssr-plus"
           DST_SSR="${SSR_BUILD}/data"
+          SSR_REV=$(date +'%Y%m%d.%H%M')
 
+          mkdir -p "${DST_SSR}/usr/lib/lua/luci"
           cp -rf "${SRC_SSR}/root/"* "${DST_SSR}/"
           cp -rf "${SRC_SSR}/luasrc/"* "${DST_SSR}/usr/lib/lua/luci/"
 
-          curl -fSL "https://raw.githubusercontent.com/lunarmodules/luasocket/master/src/url.lua" -o "${DST_SSR}/usr/lib/lua/url.lua"
-          test -s "${DST_SSR}/usr/lib/lua/url.lua"
-          [ "$(wc -c < "${DST_SSR}/usr/lib/lua/url.lua")" -gt 5000 ]
+          # 2.3 封装主程序 luci-app-ssr-plus IPK（显式声明 kmod-nft-socket 与 kmod-nft-tproxy）
+          cat << EOF > "${SSR_BUILD}/control/control"
+          Package: luci-app-ssr-plus
+          Version: 99.0-${SSR_REV}
+          Architecture: all
+          Depends: luci-compat, luci-lib-ipkg, luci-lib-jsonc, lua-neturl, lyaml, coreutils-base64, curl, ipset, resolveip, ipt2socks, dns2tcp, microsocks, kmod-nft-socket, kmod-nft-tproxy, xray-core
+          Maintainer: fw876-official
+          Section: luci
+          Priority: optional
+          Description: ShadowSocksR Plus+ LuCI interface (Official Source)
+          EOF
+          sed -i 's/^          //' "${SSR_BUILD}/control/control"
 
-          # 编译简体中文 .lmo 语言包
-          python3 - "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${DST_SSR}/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo" << 'PYEOF'
+          cat << 'EOF' > "${SSR_BUILD}/control/postinst"
+          #!/bin/sh
+          [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+          chmod +x /etc/init.d/shadowsocksr /usr/share/shadowsocksr/*.sh /usr/share/shadowsocksr/*.lua 2>/dev/null || true
+          if [ -f /etc/uci-defaults/luci-ssr-plus ]; then
+              sh /etc/uci-defaults/luci-ssr-plus && rm -f /etc/uci-defaults/luci-ssr-plus
+          fi
+          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
+          /etc/init.d/shadowsocksr enable 2>/dev/null || true
+          exit 0
+          EOF
+          sed -i 's/^          //' "${SSR_BUILD}/control/postinst"
+
+          cat << 'EOF' > "${SSR_BUILD}/control/prerm"
+          #!/bin/sh
+          /etc/init.d/shadowsocksr stop 2>/dev/null || true
+          /etc/init.d/shadowsocksr disable 2>/dev/null || true
+          exit 0
+          EOF
+          sed -i 's/^          //' "${SSR_BUILD}/control/prerm"
+          chmod 755 "${SSR_BUILD}/control/postinst" "${SSR_BUILD}/control/prerm"
+
+          echo "2.0" > "${SSR_BUILD}/debian-binary"
+          tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/data.tar.gz" -C "${SSR_BUILD}/data" .
+          tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/control.tar.gz" -C "${SSR_BUILD}/control" .
+          tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_99.0-${SSR_REV}_all.ipk" -C "${SSR_BUILD}" debian-binary control.tar.gz data.tar.gz
+
+          # 2.4 编译官方简体中文 .lmo 并封装独立中文包 luci-i18n-ssr-plus-zh-cn IPK
+          python3 - "${SRC_SSR}/po/zh-cn/ssr-plus.po" "${ZH_BUILD}/data/usr/lib/lua/luci/i18n/ssr-plus.zh-cn.lmo" << 'PYEOF'
           import sys, struct
 
           def sfh_hash(data):
@@ -217,51 +258,27 @@ jobs:
               f.write(out)
           PYEOF
 
-          # 2.3 生成标准 control（移除 luci-lua-runtime，其余用户态依赖全本地直装）
-          SSR_REV=$(date +'%Y%m%d.%H%M')
-          cat << EOF > "${SSR_BUILD}/control/control"
-          Package: luci-app-ssr-plus
-          Version: 99.0-${SSR_REV}-lite
+          cat << EOF > "${ZH_BUILD}/control/control"
+          Package: luci-i18n-ssr-plus-zh-cn
+          Version: 99.0-${SSR_REV}
           Architecture: all
-          Depends: luci-compat, luci-lib-ipkg, luci-lib-jsonc, lua-neturl, coreutils-base64, curl, ipset, resolveip, ipt2socks, dns2tcp, microsocks, kmod-nft-tproxy, xray-core
-          Maintainer: custom-lite
+          Depends: luci-app-ssr-plus
+          Maintainer: fw876-official
           Section: luci
           Priority: optional
-          Description: Lightweight ShadowSocksR Plus+ Offline Bundle (zh-cn) for MT7621
+          Description: Translation for luci-app-ssr-plus - 简体中文 (Chinese)
           EOF
-          sed -i 's/^          //' "${SSR_BUILD}/control/control"
+          sed -i 's/^          //' "${ZH_BUILD}/control/control"
 
-          cat << 'EOF' > "${SSR_BUILD}/control/postinst"
-          #!/bin/sh
-          [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
-          chmod +x /etc/init.d/shadowsocksr /usr/share/shadowsocksr/*.sh /usr/share/shadowsocksr/*.lua 2>/dev/null || true
-          if [ -f /etc/uci-defaults/luci-ssr-plus ]; then
-              sh /etc/uci-defaults/luci-ssr-plus && rm -f /etc/uci-defaults/luci-ssr-plus
-          fi
-          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
-          /etc/init.d/shadowsocksr enable 2>/dev/null || true
-          exit 0
-          EOF
-          sed -i 's/^          //' "${SSR_BUILD}/control/postinst"
-
-          cat << 'EOF' > "${SSR_BUILD}/control/prerm"
-          #!/bin/sh
-          /etc/init.d/shadowsocksr stop 2>/dev/null || true
-          /etc/init.d/shadowsocksr disable 2>/dev/null || true
-          exit 0
-          EOF
-          sed -i 's/^          //' "${SSR_BUILD}/control/prerm"
-          chmod 755 "${SSR_BUILD}/control/postinst" "${SSR_BUILD}/control/prerm"
-
-          echo "2.0" > "${SSR_BUILD}/debian-binary"
-          tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/data.tar.gz" -C "${SSR_BUILD}/data" .
-          tar --numeric-owner --owner=0 --group=0 -czf "${SSR_BUILD}/control.tar.gz" -C "${SSR_BUILD}/control" .
-          tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-app-ssr-plus_99.0-${SSR_REV}-lite_all.ipk" -C "${SSR_BUILD}" debian-binary control.tar.gz data.tar.gz
+          echo "2.0" > "${ZH_BUILD}/debian-binary"
+          tar --numeric-owner --owner=0 --group=0 -czf "${ZH_BUILD}/data.tar.gz" -C "${ZH_BUILD}/data" .
+          tar --numeric-owner --owner=0 --group=0 -czf "${ZH_BUILD}/control.tar.gz" -C "${ZH_BUILD}/control" .
+          tar --numeric-owner --owner=0 --group=0 -czf "${PKG_DIR}/ipks/luci-i18n-ssr-plus-zh-cn_99.0-${SSR_REV}_all.ipk" -C "${ZH_BUILD}" debian-binary control.tar.gz data.tar.gz
 
           echo "PKG_LIST=$(ls -1 "${PKG_DIR}/ipks" | tr '\n' ' ')" >> "$GITHUB_ENV"
           echo "BUILD_TIME=$(date +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_ENV"
 
-      - name: 3. 生成安装脚本并封装 Makeself（不改系统软件源）
+      - name: 3. 生成安装脚本并封装 Makeself
         run: |
           set -euo pipefail
           PKG_DIR="${GITHUB_WORKSPACE}/build_tmp/payload"
@@ -270,19 +287,23 @@ jobs:
           #!/bin/sh
           set -e
 
-          echo ">>> [1/2] 安装内嵌全量 IPK（用户态依赖本地直装，kmod 由系统官方源自动补齐）..."
-          if ! opkg install ./ipks/*.ipk --force-overwrite --force-reinstall --force-downgrade; then
+          echo ">>> [1/3] 检查并从官方源补齐内核模块 (kmod-nft-socket / kmod-nft-tproxy)..."
+          if ! opkg list-installed | grep -q "^kmod-nft-socket " || ! opkg list-installed | grep -q "^kmod-nft-tproxy "; then
               opkg update || true
-              opkg install ./ipks/*.ipk --force-overwrite --force-reinstall --force-downgrade
+              opkg install kmod-nft-socket kmod-nft-tproxy
           fi
 
-          echo ">>> [2/2] 刷新 LuCI RPC 缓存..."
+          echo ">>> [2/3] 离线安装全部 IPK（官方主程序 + 中文包 + cooluc 核心与全量依赖）..."
+          opkg install ./ipks/*.ipk --force-overwrite --force-reinstall --force-downgrade
+
+          echo ">>> [3/3] 刷新 LuCI 缓存..."
+          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/*
           /etc/init.d/rpcd restart 2>/dev/null || true
           echo "安装完成！请在后台：服务 -> ShadowSocksR Plus+ 更新订阅并选择节点。"
           EOF
 
           chmod +x "${PKG_DIR}/install.sh"
-          makeself --gzip "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus-Lite MT7621 Offline" ./install.sh
+          makeself --gzip "${PKG_DIR}" "${GITHUB_WORKSPACE}/${OUTPUT_NAME}" "SSR-Plus Official MT7621" ./install.sh
 
       - name: 4. 清理旧的 Release 与 Tag
         env:
@@ -295,10 +316,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "SSR-Plus Lite Offline Bundle zh-CN MT7621 (Latest)"
+          name: "SSR-Plus Official + Cooluc Deps MT7621 (Latest)"
           body: |
             - **构建时间**：`${{ env.BUILD_TIME }}`
             - **内嵌全量 IPK**：`${{ env.PKG_LIST }}`
-            - **安装特性**：剔除 `luci-lua-runtime` 并净化 IPK 文件名中的 `~` 字符，彻底解决旧版 `opkg` 报 `Illegal file name` 错误。
+            - **打包结构**：官方 `fw876/helloworld` 主程序与独立中文包 + `cooluc` 源 `xray-core` 与全量用户态依赖，安装时自动由路由器官方源补齐 `kmod-nft-socket` 和 `kmod-nft-tproxy`。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
