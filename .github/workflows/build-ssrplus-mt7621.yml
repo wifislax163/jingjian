@@ -39,7 +39,7 @@ jobs:
           mkdir -p "${PKG_DIR}/ipks" "${IDX_DIR}" \
                    "${SSR_BUILD}/data/usr/lib/lua/luci/i18n" "${SSR_BUILD}/control"
 
-          # 2.1 下载索引表并递归解析所有用户态依赖（含 luci-compat，跳过 kmod 留给官方源匹配内核）
+          # 2.1 下载索引表并递归解析所有用户态依赖（自动净化文件名中的 ~ 等非法字符）
           curl -fsSL "${COOLUC_URL}/Packages.gz" | gunzip > "${IDX_DIR}/cooluc.idx"
           for feed in base luci packages routing telephony; do
             curl -fsSL "${OWRT_PKG_URL}/${feed}/Packages.gz" | gunzip > "${IDX_DIR}/${feed}.idx"
@@ -47,7 +47,7 @@ jobs:
           curl -fsSL "${OWRT_BASE_URL}/Packages.gz" | gunzip > "${IDX_DIR}/target.idx"
 
           python3 - "${IDX_DIR}" "${PKG_DIR}/ipks" "${COOLUC_URL}" "${OWRT_PKG_URL}" "${OWRT_BASE_URL}" << 'PYEOF'
-          import sys, os, urllib.request
+          import sys, os, re, urllib.request
 
           idx_dir, out_dir, cooluc_url, owrt_pkg_url, owrt_base_url = sys.argv[1:6]
 
@@ -63,8 +63,8 @@ jobs:
           SKIP_PKGS = {
               "libc", "libgcc1", "libpthread", "librt", "libstdcpp6", "zlib",
               "kernel", "base-files", "busybox", "uci", "ubus", "ubox", "rpcd",
-              "uhttpd", "luci-base", "luci-mod-admin-full", "lua", "libuci-lua",
-              "libubus-lua", "libnixio", "ca-bundle", "ca-certificates"
+              "uhttpd", "luci-base", "luci-mod-admin-full", "luci-lua-runtime",
+              "lua", "libuci-lua", "libubus-lua", "libnixio", "ca-bundle", "ca-certificates"
           }
 
           pkg_map = {}
@@ -87,7 +87,7 @@ jobs:
                           cur[k] = v
 
           ROOT_DEPS = [
-              "xray-core", "luci-compat", "luci-lib-ipkg", "luci-lua-runtime",
+              "xray-core", "luci-compat", "luci-lib-ipkg",
               "luci-lib-jsonc", "lua-neturl", "coreutils-base64", "curl",
               "ipset", "resolveip", "ipt2socks", "dns2tcp", "microsocks"
           ]
@@ -105,8 +105,9 @@ jobs:
                   continue
               base_url, rel_file, deps_str = pkg_map[pkg]
               dl_url = f"{base_url}/{rel_file}"
-              dst_file = os.path.join(out_dir, os.path.basename(rel_file))
-              print(f"[FETCH] {pkg} -> {os.path.basename(rel_file)}")
+              safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', os.path.basename(rel_file))
+              dst_file = os.path.join(out_dir, safe_name)
+              print(f"[FETCH] {pkg} -> {safe_name}")
               urllib.request.urlretrieve(dl_url, dst_file)
 
               for raw_dep in deps_str.split(","):
@@ -216,13 +217,13 @@ jobs:
               f.write(out)
           PYEOF
 
-          # 2.3 生成标准 control（用户态依赖全本地安装，kmod-nft-tproxy 自动从路由器自带官方源拉取）
+          # 2.3 生成标准 control（移除 luci-lua-runtime，其余用户态依赖全本地直装）
           SSR_REV=$(date +'%Y%m%d.%H%M')
           cat << EOF > "${SSR_BUILD}/control/control"
           Package: luci-app-ssr-plus
           Version: 99.0-${SSR_REV}-lite
           Architecture: all
-          Depends: luci-compat, luci-lib-ipkg, luci-lua-runtime, luci-lib-jsonc, lua-neturl, coreutils-base64, curl, ipset, resolveip, ipt2socks, dns2tcp, microsocks, kmod-nft-tproxy, xray-core
+          Depends: luci-compat, luci-lib-ipkg, luci-lib-jsonc, lua-neturl, coreutils-base64, curl, ipset, resolveip, ipt2socks, dns2tcp, microsocks, kmod-nft-tproxy, xray-core
           Maintainer: custom-lite
           Section: luci
           Priority: optional
@@ -298,6 +299,6 @@ jobs:
           body: |
             - **构建时间**：`${{ env.BUILD_TIME }}`
             - **内嵌全量 IPK**：`${{ env.PKG_LIST }}`
-            - **安装特性**：不修改路由器软件源；用户态全量依赖（含 `luci-compat`、`xray-core`）离线秒装，`kmod-nft-tproxy` 自动由固件自带官方源匹配内核安装。
+            - **安装特性**：剔除 `luci-lua-runtime` 并净化 IPK 文件名中的 `~` 字符，彻底解决旧版 `opkg` 报 `Illegal file name` 错误。
           files: |
             ${{ github.workspace }}/${{ env.OUTPUT_NAME }}
